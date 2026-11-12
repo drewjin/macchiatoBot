@@ -299,8 +299,11 @@ feishu:
 
 memory:
   enabled: true
-  # 工作记忆上限；8000 会在长会话里过早压缩，丢掉关键上下文
-  max_working_tokens: 500000
+  # 工作记忆上限（token）。压缩在 0.8 × 该值时触发。
+  # 8000 太小：长会话每轮都在压缩、丢上下文；但不能直接开到 50 万——
+  # 阈值变成 40 万后压缩永远不触发，工作集无上限增长，
+  # 实测一个会话攒到 16 万 token 后每轮模型都要 10 分钟才响应。
+  max_working_tokens: 60000
   working_summary_threshold: 0.8
   working_summary_hard_ratio: null
   working_keep_recent: 4
