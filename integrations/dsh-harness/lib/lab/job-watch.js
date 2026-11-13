@@ -11,6 +11,13 @@
  *     → 终态时 `agent.followup(...)`：DSH 的空闲 agent 会被唤醒，自动开一轮把结果讲出来
  *
  * 护栏：同一 job 只汇报一次、最多同时跟 8 个、超过 6 小时放弃、轮询失败不打断。
+ *
+ * **不要打扰正在对话的用户（2026-11-13）**：多条 job 同时结束、或用户正说着话时，
+ * 立刻 followup 会在会话里凭空多出一轮（实测造成「莫名被插入任务完成消息，然后卡住」）。
+ * 改成：
+ *   - 结束的 job 先攒进 pending，**等 agent 空闲**才投递；
+ *   - 攒在同一批里的多个 job 合成一条消息；
+ *   - 空闲等待最多 30 分钟，超时丢弃并记日志。
  */
 import { MbotLink } from "./wire.js";
 import { labConfig, mbotIdentity } from "./config.js";
@@ -24,6 +31,12 @@ const MAX_AGE_MS = 6 * 60 * 60 * 1000;
 const TERMINAL = new Set(["finished", "failed", "timed_out", "cancelled"]);
 
 let activeWatchers = 0;
+/** 已结束、等 agent 空闲后一起投递的 job 消息 */
+let pendingLines = [];
+let pendingSince = 0;
+let deliverTimer = null;
+let DELIVER_RETRY_MS = 15_000;
+const PENDING_MAX_AGE_MS = 30 * 60 * 1000;
 
 /**
  * 从工具结果文本里认出「后台化」。
@@ -111,18 +124,7 @@ export function trackJob({ agent, jobId, command = "", clientId, log = () => {} 
 				data.log_path ? `日志：${data.log_path}` : "",
 			].filter(Boolean);
 			const text = lines.join("\n");
-			/*
-			 * 收件箱按 message.id 去重（重复会抛 "already pending"），
-			 * 所以这里必须给一个唯一 id；形状对齐 session 日志里的 user/message。
-			 */
-			const message = {
-				id: `lab-job-${jobId}-${Date.now().toString(36)}`,
-				role: "user",
-				content: [{ type: "text", text }],
-				source: { kind: "user", rpcId: `lab-job-${jobId}` },
-			};
-			agent?.followup?.(message);
-			log(`job-watch: ${jobId} 已汇报给会话`);
+			enqueueDelivery(agent, jobId, text, log);
 		} catch (error) {
 			/* 轮询失败不放弃：daemon 可能正在重启，下一轮再试 */
 			if (Date.now() - startedAt > MAX_AGE_MS) {
@@ -140,8 +142,80 @@ export function trackJob({ agent, jobId, command = "", clientId, log = () => {} 
 	return true;
 }
 
+
+/** agent 是否空闲（测试里的假 agent 没有 phase，按空闲处理）。 */
+function agentIdle(agent) {
+	const kind = agent?.phase?.kind;
+	return kind === undefined || kind === null || kind === "idle";
+}
+
+/**
+ * 攒下一条汇报，等会话空闲再一次性投递。
+ *
+ * @param {any} agent
+ * @param {string} jobId
+ * @param {string} text
+ * @param {(message: string) => void} log
+ */
+export function enqueueDelivery(agent, jobId, text, log = () => {}) {
+	pendingLines.push({ jobId, text });
+	if (pendingSince === 0) pendingSince = Date.now();
+	if (deliverTimer !== null) return;
+	deliverTimer = setInterval(() => {
+		if (pendingLines.length === 0) {
+			stopDeliveryTimer();
+			return;
+		}
+		if (Date.now() - pendingSince > PENDING_MAX_AGE_MS) {
+			log(`job-watch: 汇报排队超过 30 分钟，丢弃 ${pendingLines.length} 条`);
+			flushPending();
+			stopDeliveryTimer();
+			return;
+		}
+		if (!agentIdle(agent)) return;
+		const batch = flushPending();
+		stopDeliveryTimer();
+		const text = batch.map((item) => item.text).join("\n\n");
+		const ids = batch.map((item) => item.jobId).join(",");
+		/*
+		 * 收件箱按 message.id 去重（重复会抛 "already pending"），
+		 * 所以这里必须给一个唯一 id；形状对齐 session 日志里的 user/message。
+		 */
+		const message = {
+			id: `lab-job-${ids}-${Date.now().toString(36)}`.slice(0, 120),
+			role: "user",
+			content: [{ type: "text", text }],
+			source: { kind: "user", rpcId: `lab-job-${ids}` },
+		};
+		agent?.followup?.(message);
+		log(`job-watch: 已汇报 ${batch.length} 条（${ids}）`);
+	}, DELIVER_RETRY_MS);
+}
+
+function flushPending() {
+	const batch = pendingLines;
+	pendingLines = [];
+	pendingSince = 0;
+	return batch;
+}
+
+function stopDeliveryTimer() {
+	if (deliverTimer !== null) {
+		clearInterval(deliverTimer);
+		deliverTimer = null;
+	}
+}
+
 /** 测试用：重置内部状态。 */
 export function __resetForTest() {
 	TRACKED.clear();
 	activeWatchers = 0;
+	pendingLines = [];
+	pendingSince = 0;
+	stopDeliveryTimer();
+}
+
+/** 测试用：把空闲投递的重试间隔改小（默认 15s）。 */
+export function __setDeliverIntervalForTest(ms) {
+	DELIVER_RETRY_MS = Math.max(0, Number(ms) || 0);
 }

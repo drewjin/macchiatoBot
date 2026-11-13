@@ -10,7 +10,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const { extractBackgroundJob, trackJob, __resetForTest } = await import("../lib/lab/job-watch.js");
+const { extractBackgroundJob, trackJob, __resetForTest, __setDeliverIntervalForTest } = await import("../lib/lab/job-watch.js");
 
 let failures = 0;
 const check = (label, ok, extra) => {
@@ -62,6 +62,7 @@ await new Promise((resolve) => server.listen(socketPath, resolve));
 process.env.LAB_MBOT_SOCK = socketPath;
 
 __resetForTest();
+__setDeliverIntervalForTest(50);  // 投递要等「空闲」，测试里把重试间隔调小
 const followed = [];
 const agent = { session: { id: "s1" }, followup: (message) => followed.push(message) };
 const started = trackJob({ agent, jobId: "job_test1", command: "sleep 300", clientId: "c1", log: () => {} });

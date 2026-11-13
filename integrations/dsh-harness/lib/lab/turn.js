@@ -8,6 +8,7 @@
 import { labConfig, mbotIdentity } from "./config.js";
 import { extractBackgroundJob, trackJob } from "./job-watch.js";
 import { cannedEvents, toLabEvents } from "./events.js";
+import { imageContentItems } from "./media.js";
 import { messageText, turnText } from "./text.js";
 import { MbotError, MbotLink, abortError } from "./wire.js";
 import { resolveSessionWorkspace } from "./workspace-model.js";
@@ -84,9 +85,23 @@ export class LabTurn {
 			throw new MbotError("回合没有可发送的用户输入", { code: "MBOT_EMPTY_INPUT" });
 		}
 		this.#log(`turn ${this.turn} → ${this.sessionId} · ${text.slice(0, 80)}`);
+		/*
+		 * 每个 DSH 会话一个独立的记忆 owner（data/memory/dsh/<会话>）。
+		 * 不传的话 daemon 会用 IPC 的默认 owner（cli:root），于是所有会话共用
+		 * 同一份工作记忆与 checkpoint —— 换工作区/换会话时上一个话题的上下文还在，
+		 * 表现为「串台」。
+		 */
+		const memoryOwner = `dsh:${this.agent.session.id}`;
+		/* 图片：DSH 的 image 块 → mbot 的 content_items（只给路径，二进制由 daemon 按轮内联） */
+		const contentItems = imageContentItems(this.decision.messages, { log: (m) => this.#log(m) });
+		const metadata = {
+			memory_owner: memoryOwner,
+			...contentItems.length > 0 ? { content_items: contentItems } : {},
+		};
+		if (contentItems.length > 0) this.#log(`本轮带 ${contentItems.length} 张图片`);
 		const frames = this.link.stream(
 			"run_turn_stream",
-			{ client_id: this.clientId, text },
+			{ client_id: this.clientId, text, metadata },
 			{
 				signal: this.signal,
 				idleMs: () => (this.pendingTools > 0 ? this.config.toolMs : this.config.stallMs),
